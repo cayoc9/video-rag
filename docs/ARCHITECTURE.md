@@ -1,178 +1,269 @@
 # Arquitetura do Pipeline Video RAG — Laboratório
 
-> Proposta de arquitetura para o modelo híbrido (cloud indexação + local consulta)
+> **Revisão:** Junho/2026 — Servidor `avancos` (192.168.1.9:11434) integrado  
+> Arquitetura 100% local: elimina necessidade de RunPod para experimentos
 
 ---
 
-## Visão Geral
+## Mudança de Estratégia: Cloud → Híbrido Local
+
+| Componente | Plano Anterior (servidor fora) | **Plano Atual (avancos online)** |
+|-----------|-------------------------------|----------------------------------|
+| Embedding visual | CLIP via RunPod (~$5–80) | **llava / qwen3-vl via avancos ($0)** |
+| Descrição de frames | GroundingDINO cloud | **llava:latest local (vision model)** |
+| LLM de consulta | GPT-4o-mini (pago) | **qwen2.5:7b / deepseek-r1 local ($0)** |
+| ASR (transcrição) | Whisper local (CPU) | Whisper local ou **agente_whisper existente** |
+| Vector DB | FAISS CPU local | **ChromaDB local** (mesmo host) |
+
+**Resultado:** Custo de experimentação = **R$ 0,00** (energia da rede já paga)
+
+---
+
+## Nova Arquitetura — 100% Local + avancos
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        FASE 1: INDEXAÇÃO (Cloud)                    │
-│                         RunPod RTX 3090/4090                        │
-│                                                                     │
-│  Vídeo → [Extrator] → ASR/OCR/Frames → [Embeddings] → [Índice]    │
-│             ↓                                ↓              ↓       │
-│          Whisper                        CLIP/BLIP        FAISS     │
-│          EasyOCR                      Sentence-T         Qdrant    │
-│         GroundingDINO                                    Chroma    │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ Download do Índice (~GB)
-                               ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                   FASE 2: PERSISTÊNCIA (Local)                      │
-│                      /mnt/large-memory                              │
-│                                                                     │
-│           Índice Vetorial + Grafo de Conhecimento                   │
-│           (metadados de timestamps + embeddings)                    │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ Query
-                               ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                    FASE 3: CONSULTA (Local + API)                   │
-│                       CPU Intel Xeon                                │
-│                                                                     │
-│  Pergunta → [Retriever] → Top-K Segmentos → [LLM] → Resposta       │
-│                 ↓                                ↓                  │
-│           Busca vetorial                   GPT-4o-mini              │
-│           (FAISS CPU)                    (~centavos/query)          │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    FASE 1: EXTRAÇÃO DE FEATURES                      │
+│                       Máquina Local (CPU)                            │
+│                                                                      │
+│  Vídeo → ffmpeg (1fps) → Frames PNG                                  │
+│       → Whisper (agente_whisper) → Transcript .txt                   │
+│       → EasyOCR → Textos detectados nos frames                       │
+└──────────────────────────┬───────────────────────────────────────────┘
+                           │ Frames + Textos
+                           ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│                 FASE 2: DESCRIÇÃO VISUAL (avancos)                   │
+│                   192.168.1.9:11434  via Ollama API                  │
+│                                                                      │
+│  Frame PNG → [llava:latest]  → "pessoa usando capacete..."           │
+│  Frame PNG → [qwen3-vl]      → descrição mais detalhada (opcional)   │
+│  Frame PNG → [minicpm-v]     → alternativa mais leve                 │
+│                                                                      │
+│  Modelos vision disponíveis:                                         │
+│    llava:latest ✅  llava:7b  llama3.2-vision                        │
+│    minicpm-v  moondream  qwen3-vl  glm-ocr                           │
+└──────────────────────────┬───────────────────────────────────────────┘
+                           │ Descrições textuais dos frames
+                           ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│                    FASE 3: INDEXAÇÃO (Local)                         │
+│                    /mnt/large-memory (364GB)                         │
+│                                                                      │
+│  [Transcript + OCR + Descrição Visual]                               │
+│          → Embedding via nomic-embed / all-MiniLM (CPU)              │
+│          → ChromaDB local                                            │
+│          → Estrutura: {video_id, start_time, end_time,               │
+│                        text_chunk, visual_desc, embedding}           │
+└──────────────────────────┬───────────────────────────────────────────┘
+                           │ Query do usuário
+                           ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│                    FASE 4: CONSULTA RAG (avancos)                    │
+│                   192.168.1.9:11434  via Ollama API                  │
+│                                                                      │
+│  Pergunta → Embedding → FAISS → Top-K segmentos                      │
+│           → Contexto → [qwen2.5:7b ou deepseek-r1]                   │
+│           → Resposta + timestamps das fontes                         │
+│                                                                      │
+│  Modelos de texto disponíveis:                                       │
+│    qwen2.5:7b ✅  qwen3  gemma3  llama3.x                            │
+│    deepseek-r1:7b→70b (raciocínio complexo)                          │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Componentes Técnicos
+## Componentes Técnicos (Revisados)
 
-### Extração (Fase 1)
+### Fase 1 — Extração Local
 
 ```python
-# Stack de extração recomendado
-
+# Stack de extração (CPU local)
 EXTRACTION_STACK = {
-    "audio_transcription": "openai/whisper-large-v3",  # ASR
-    "frame_sampling": "ffmpeg",                         # 1 frame/segundo (adaptável)
-    "ocr": "EasyOCR",                                   # Texto em frames
-    "object_detection": "GroundingDINO",                # Descrição visual
-    "scene_detection": "PySceneDetect"                  # Segmentação por cena
+    "audio_transcription": "agente_whisper (já configurado)",
+    "frame_sampling": "ffmpeg",          # 1 frame/segundo padrão
+    "ocr": "EasyOCR",                    # Texto detectado nos frames
+    "scene_detection": "PySceneDetect"  # Segmentação por cena
 }
 
-# Configuração de amostragem adaptativa
 FRAME_SAMPLING = {
     "base_fps": 1,           # 1 frame/segundo padrão
-    "high_motion_fps": 4,    # 4 frames/segundo quando há movimento
-    "motion_threshold": 0.3  # Threshold de mudança entre frames
+    "high_motion_fps": 4,    # se PySceneDetect detectar corte de cena
+    "output_format": "jpg",  # menor que PNG
+    "resize": "336x336"      # tamanho padrão de entrada para vision models
 }
 ```
 
-### Indexação (Fase 1)
+### Fase 2 — Descrição Visual via avancos
 
 ```python
-# Embeddings multimodais
-EMBEDDING_MODELS = {
-    "visual": "openai/clip-vit-large-patch14",
-    "text": "sentence-transformers/all-MiniLM-L6-v2",
-    "multimodal": "BLIP-2"  # Para embeddings conjuntos
-}
+# Cliente Ollama via API OpenAI-compatible
+import base64
+from openai import OpenAI
 
-# Vector store
-VECTOR_STORE = "qdrant"  # Alternativa: FAISS (mais simples, CPU-friendly)
+client = OpenAI(
+    base_url="http://192.168.1.9:11434/v1",
+    api_key="ollama"  # qualquer valor
+)
 
-# Estrutura de chunk (segmento de vídeo)
-CHUNK_STRUCTURE = {
-    "video_id": "str",
-    "start_time": "float",   # segundos
-    "end_time": "float",     # segundos  
-    "transcript": "str",     # ASR texto
-    "ocr_text": "str",       # Texto extraído visualmente
-    "visual_description": "str",  # GroundingDINO output
-    "embedding": "list[float]",   # 768 dims
-    "scene_id": "int"
+def describe_frame(frame_path: str, model: str = "llava:latest") -> str:
+    """Gera descrição textual de um frame via avancos."""
+    with open(frame_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": "Descreva objetivamente o que está acontecendo nesta imagem em português. Foque em pessoas, objetos, ações e texto visível."}
+            ]
+        }],
+        max_tokens=200
+    )
+    return response.choices[0].message.content
+
+# Seleção de modelo por necessidade:
+VISION_MODELS = {
+    "rápido":    "moondream",           # menor, mais veloz
+    "padrão":    "llava:latest",        # testado e funcionando ✅
+    "detalhado": "qwen3-vl",            # melhor para OCR e detalhes
+    "ocr_puro":  "glm-ocr"             # especializado em texto
 }
 ```
 
-### Consulta (Fase 3)
+### Fase 3 — Indexação e Vector DB
 
 ```python
-# Pipeline de consulta
-QUERY_PIPELINE = """
-1. Receber pergunta do usuário
-2. Gerar embedding da pergunta (mesmos modelos da indexação)
-3. Busca vetorial → Top-10 segmentos mais similares
-4. Re-ranking contextual (cross-encoder se disponível)
-5. Montar contexto: [timestamp, transcript, descrição visual]
-6. Enviar para GPT-4o-mini com prompt estruturado
-7. Retornar resposta + timestamps das fontes
-"""
+# ChromaDB local (sem custo, persiste em disco)
+import chromadb
+from sentence_transformers import SentenceTransformer
 
-RETRIEVAL_CONFIG = {
-    "top_k": 10,
-    "reranking": False,      # Desabilitar se CPU lenta
-    "context_window": 5,     # Segmentos vizinhos ao recuperado
+chroma = chromadb.PersistentClient(path="/mnt/large-memory/videorag_index")
+collection = chroma.get_or_create_collection("video_chunks")
+
+# Embedding de texto (CPU local)
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim, ~80MB
+
+# Estrutura de chunk
+CHUNK = {
+    "id": "video123_t045_t090",        # video_id + timestamps
+    "documents": "transcrição + descrição visual concatenadas",
+    "metadatas": {
+        "video_id": "aula_01.mp4",
+        "start_time": 45.0,
+        "end_time": 90.0,
+        "transcript": "o professor explica...",
+        "visual_desc": "slide com gráfico de barras...",
+        "ocr_text": "Título: Redes Neurais"
+    }
 }
 ```
 
----
+### Fase 4 — Consulta RAG via avancos
 
-## Tecnologias por Componente
+```python
+def query_videorag(pergunta: str, top_k: int = 5) -> dict:
+    """Pipeline completo de consulta."""
+    # 1. Embedding da pergunta
+    q_embedding = embed_model.encode(pergunta)
 
-| Componente | Opção Gratuita/Local | Opção Cloud (Paga) |
-|-----------|---------------------|-------------------|
-| **ASR** | Whisper (local) | Deepgram, AssemblyAI |
-| **OCR** | EasyOCR, Tesseract | Google Vision API |
-| **Embeddings** | CLIP, SentenceT | OpenAI ada-002 |
-| **Vector DB** | FAISS, ChromaDB | Pinecone, Qdrant Cloud |
-| **LLM (Query)** | Ollama/Llama3 local | GPT-4o-mini, Gemini Flash |
-| **Orquestração** | LangChain, LlamaIndex | — |
+    # 2. Busca vetorial no ChromaDB
+    results = collection.query(
+        query_embeddings=[q_embedding.tolist()],
+        n_results=top_k
+    )
 
----
+    # 3. Montar contexto com timestamps
+    contexto = "\n---\n".join([
+        f"[{m['video_id']} @ {m['start_time']:.0f}s–{m['end_time']:.0f}s]\n"
+        f"Fala: {m['transcript']}\nVisual: {m['visual_desc']}"
+        for m in results["metadatas"][0]
+    ])
 
-## Estimativas de Custo e Tempo
+    # 4. Resposta via avancos (LLM de texto)
+    resp = client.chat.completions.create(
+        model="qwen2.5:7b",  # ou deepseek-r1 para raciocínio complexo
+        messages=[
+            {"role": "system", "content": "Você é um assistente que responde sobre vídeos com base nos trechos fornecidos. Sempre cite o timestamp da fonte."},
+            {"role": "user", "content": f"Contexto dos vídeos:\n{contexto}\n\nPergunta: {pergunta}"}
+        ]
+    )
 
-### Indexação (RunPod, RTX 3090)
-
-| Volume | Tempo Estimado | Custo (@$0.39/h) |
-|--------|---------------|------------------|
-| 10h de vídeo | ~2h de GPU | ~$0.78 |
-| 100h de vídeo | ~15h de GPU | ~$5.85 |
-| 1000h de vídeo | ~120h de GPU | ~$46.80 |
-
-### Consulta (Local ou API)
-
-| Modo | Latência/Query | Custo/1000 Queries |
-|------|---------------|-------------------|
-| CPU Local (Intel Xeon) | 2–8s | $0 |
-| GPT-4o-mini | 1–3s | ~$0.15 |
-| GPT-4o | 2–5s | ~$2.50 |
-
----
-
-## Diagrama de Dados
-
-```
-Vídeo Original (MP4/MKV)
-├── Audio Stream
-│   └── Whisper ASR → Transcript chunks [00:00:00 → 00:02:30]: "texto..."
-├── Video Stream
-│   ├── Frame @ 1fps → CLIP Embedding [768-dim]
-│   ├── EasyOCR → Texto detectado
-│   └── GroundingDINO → "pessoa segurando capacete, máquina CNC ao fundo"
-└── Metadata
-    ├── Duration, FPS, Resolution
-    └── Scene boundaries [0, 45, 132, 287, ...] segundos
-
-         ↓ Indexação
-
-Vector DB (Qdrant/FAISS)
-└── Collections:
-    ├── visual_embeddings [clip-vit-L/14, 768-dim]
-    ├── text_embeddings [all-MiniLM-L6, 384-dim]
-    └── multimodal_embeddings [BLIP-2, 768-dim]
-
-Knowledge Graph (opcional, para STAR-RAG)
-└── Nodes: entidades (pessoas, objetos, locais)
-└── Edges: relações temporais e causais
+    return {
+        "resposta": resp.choices[0].message.content,
+        "fontes": results["metadatas"][0]
+    }
 ```
 
 ---
 
-*Arquitetura proposta — Junho/2026*
+## Mapa de Modelos do avancos para Video RAG
+
+| Tarefa | Modelo Recomendado | Alternativa | Notas |
+|--------|-------------------|-------------|-------|
+| Descrição de frame geral | `llava:latest` ✅ | `minicpm-v` | Testado e funcionando |
+| OCR / texto em slide | `glm-ocr` | `qwen3-vl` | Especializado em texto |
+| Análise detalhada de cena | `qwen3-vl` | `llama3.2-vision` | Melhor compreensão multimodal |
+| Frames rápidos (pré-filtro) | `moondream` | — | Mais leve e veloz |
+| Resposta RAG (texto) | `qwen2.5:7b` | `gemma3` | Bom custo-benefício local |
+| Raciocínio complexo | `deepseek-r1:7b` | `deepseek-r1:70b` | Para queries difíceis |
+| Código / scripts | `qwen2.5-coder` | `codellama` | Geração de análise automática |
+
+---
+
+## Estimativa de Throughput (avancos local)
+
+| Operação | Velocidade Estimada | Volume (ex: 10h vídeo) |
+|----------|--------------------|-----------------------|
+| Extração de frames (ffmpeg) | ~realtime | ~36.000 frames @ 1fps |
+| Transcrição Whisper (CPU) | ~2–3x tempo real | ~20–30h de CPU |
+| Descrição visual (llava:latest) | ~2–5s/frame | ~20–50h (gargalo) |
+| Descrição visual (moondream) | ~0.5–1s/frame | ~5–10h |
+| Indexação ChromaDB | muito rápido | < 10min |
+| Query RAG | 3–8s/query | $0 |
+
+> **Gargalo principal:** Descrição visual frame-a-frame. Estratégia: descrever apenas **1 frame por cena** (usar PySceneDetect para detectar cortes) → reduz de 36k para ~300–500 frames por hora de vídeo.
+
+---
+
+## Plano de Experimento Imediato (Proof of Concept)
+
+```bash
+# Sequência sugerida para primeiro teste
+
+# 1. Preparar vídeo piloto (30min de aula)
+VIDEO="aula_piloto.mp4"
+
+# 2. Extrair frames @ 1fps
+ffmpeg -i $VIDEO -vf fps=1 frames/frame_%04d.jpg
+
+# 3. Transcrever áudio
+# (usar agente_whisper já configurado)
+
+# 4. Descrever frames via avancos
+python extract_visual.py --model llava:latest --input frames/ --output descriptions.jsonl
+
+# 5. Indexar no ChromaDB
+python index.py --transcript transcript.txt --visual descriptions.jsonl --db /mnt/large-memory/videorag_index
+
+# 6. Testar query
+python query.py --question "Em que minuto o professor apresentou o gráfico de comparação?"
+```
+
+---
+
+## Comparativo de Custos: Antes vs. Depois
+
+| Fase | Antes (RunPod) | **Depois (avancos)** |
+|------|---------------|----------------------|
+| Descrição visual | ~$5–80 | **$0** |
+| LLM de consulta | ~$0.15/1000 queries | **$0** |
+| Embedding | ~$0.10/1000 | **$0** |
+| **Total (100h vídeo)** | ~$15–80 | **$0** |
+
+---
+
+*Arquitetura revisada — Junho/2026 (avancos server integrado)*

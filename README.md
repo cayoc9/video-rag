@@ -87,17 +87,27 @@ video-rag/
 
 ---
 
-## 💻 Estratégia de Implementação (Modelo Híbrido)
+## 💻 Estratégia de Implementação — 100% Local (avancos)
+
+> **Atualização Junho/2026:** Servidor `avancos` (192.168.1.9:11434) reintegrado. RunPod eliminado.
 
 ```
-Fase 1: Indexação → Cloud (RunPod RTX 3090/4090 @ $0.39/h)
-         ↓
-Fase 2: Download do Índice → /mnt/large-memory (persistência local)
-         ↓
-Fase 3: Consulta RAG → CPU local (Intel Xeon) + GPT-4o-mini
+Extração (CPU local):
+  ffmpeg → frames | agente_whisper → transcript | EasyOCR → OCR
+      ↓
+Descrição Visual (avancos 192.168.1.9:11434):
+  llava:latest → "pessoa usa capacete, slide com título..."
+      ↓
+Indexação (ChromaDB local /mnt/large-memory/):
+  transcript + visual_desc → embedding → ChromaDB
+      ↓
+Consulta RAG (avancos):
+  pergunta → retrieval → qwen2.5:7b → resposta + timestamps
 ```
 
-**Custo estimado:** ~$2–10 para 100h de vídeo | ~$15–80 para 1000h de vídeo
+**Modelos disponíveis no avancos:** `llava`, `qwen3-vl`, `glm-ocr`, `moondream`, `qwen2.5:7b`, `deepseek-r1:7b→70b`, `nomic-embed-text`
+
+**Custo total de experimentação: R$ 0,00**
 
 ---
 
