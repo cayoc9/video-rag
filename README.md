@@ -42,7 +42,8 @@ video-rag/
 |-----------|-----------|
 | [Estado da Arte](research/SOTA_VIDEORAG_RESEARCH.md) | Mapeamento de soluções SOTA 2025–2026 |
 | [Relatório de Viabilidade](research/VIDEORAG_REPORT.md) | Hardware, custos e estratégia híbrida |
-| [Lacunas de Pesquisa](research/RESEARCH_GAPS_DEEP.md) | Deep research: problemas em aberto |
+| [Lacunas de Pesquisa (v1)](research/RESEARCH_GAPS_DEEP.md) | Deep research: 6 lacunas críticas identificadas |
+| [Pesquisa Complementar (v2)](research/RESEARCH_COMPLEMENT_DEEP.md) | **🆕** Aprofundamento de cada lacuna com literatura 2025-2026 |
 | [Benchmarks](research/BENCHMARKS.md) | Métricas e datasets de avaliação |
 | [Arquitetura](docs/ARCHITECTURE.md) | Pipeline proposto para o laboratório |
 | [Roadmap](docs/ROADMAP.md) | Fases de implementação |
@@ -71,14 +72,18 @@ video-rag/
 
 ## 🔭 Lacunas Abertas de Pesquisa
 
-> Oportunidades para artigos e patentes identificadas nesta pesquisa:
+> 6 lacunas críticas identificadas, com aprofundamento na [Pesquisa Complementar](research/RESEARCH_COMPLEMENT_DEEP.md):
 
-1. **Raciocínio Espacial 3D** — Integrar SLAM ao RAG para localização real de objetos
-2. **Audio-Visual Grounding** — Vincular sons específicos a regiões da imagem
-3. **Streaming VideoRAG** — Poda dinâmica de grafo em tempo real com gestão de memória
-4. **Amostragem Adaptativa de FPS** — Aumentar análise apenas quando há movimento relevante
-5. **Cross-Video Knowledge** — Síntese de conhecimento entre múltiplos vídeos concorrentes
-6. **Citation Faithfulness** — Rastrear e validar quais segmentos sustentam cada afirmação gerada
+| # | Lacuna | Novidade | Frameworks Emergentes |
+|---|--------|---------|----------------------|
+| 1 | **Streaming VideoRAG** — latência vs. qualidade em tempo real | ⭐⭐⭐ | StreamRAG, V-Rex |
+| 2 | **Cross-Video Knowledge** — síntese entre múltiplos vídeos | ⭐⭐⭐ | MegaRAG, LightRAG v2 |
+| 3 | **Citation Faithfulness** — verificação de timestamp-grounded claims | ⭐⭐⭐⭐ | MiRAGe/CiteF1, FaithfulRAG |
+| 4 | **Raciocínio Espacial 3D** — integrar profundidade ao RAG | ⭐⭐⭐ | SLAM-RAG, Video Depth Anything |
+| 5 | **Audio-Visual Grounding** — localizar fonte sonora na imagem | ⭐⭐ | SSL-SaN, JAEGER |
+| 6 | **Edge Deployment** — VideoRAG em hardware < 4GB VRAM | ⭐⭐ | EdgeRAG, GGUF Q4_K_M |
+
+> 💡 **Recomendação primária:** Implementar **CiteF1-Video** (verificação de citação por timestamp) — maior novidade, alto impacto prático, realizável com o modelo híbrido do laboratório.
 
 ---
 
