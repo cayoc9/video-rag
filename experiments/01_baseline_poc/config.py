@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     )
 
     # --- ChromaDB (Vector Store) ---
-    chroma_persist_dir: str = "/mnt/large-memory/videorag_index"
+    chroma_persist_dir: str = "/mnt/storage/videorag_index"
     collection_name: str = "video_chunks"
 
     # --- Chunking ---

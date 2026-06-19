@@ -26,13 +26,22 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def format_timestamp(seconds: float) -> str:
+    """Converte segundos para MM:SS ou HH:MM:SS."""
+    if seconds < 0:
+        return "00:00"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 def parse_transcript(transcript_path: Path) -> list[dict]:
     """
-    Parseia transcrição Whisper (formato SRT ou TXT com timestamps).
-
-    Suporta:
-    - Formato Whisper SRT: "00:00:45,000 --> 00:01:30,000\nTexto da fala"
-    - Formato Whisper TXT simples: texto contínuo (chunks de N chars)
+    Parseia transcrição Whisper (formato SRT ou TXT com timestamps)
+    e agrupa em chunks de tempo de aproximadamente 30 segundos para maior contexto semântico.
 
     Returns:
         Lista de {start_sec, end_sec, text}
@@ -49,20 +58,54 @@ def parse_transcript(transcript_path: Path) -> list[dict]:
         h, m, s = ts.split(":")
         return int(h) * 3600 + int(m) * 60 + float(s)
 
-    chunks = []
+    raw_segments = []
     matches = list(srt_pattern.finditer(content))
 
     if matches:
-        logger.info(f"Formato SRT detectado: {len(matches)} segmentos")
+        logger.info(f"Formato SRT detectado: {len(matches)} segmentos brutos")
         for m in matches:
-            chunks.append({
+            raw_segments.append({
                 "start_sec": srt_to_sec(m.group(1)),
                 "end_sec": srt_to_sec(m.group(3)),
                 "text": m.group(5).strip().replace("\n", " ")
             })
+        
+        # Agrupar segmentos usando sliding window (janela deslizante)
+        # Janela de 45s com passo de 15s para garantir sobreposição e contexto completo
+        window_duration = 45.0
+        slide_step = 15.0
+        chunks = []
+        
+        if raw_segments:
+            start_time = raw_segments[0]["start_sec"]
+            end_time = raw_segments[-1]["end_sec"]
+            
+            current_start = start_time
+            while current_start < end_time:
+                current_end = current_start + window_duration
+                # Filtrar segmentos pertencentes a esta janela
+                window_segs = [
+                    s for s in raw_segments 
+                    if (s["start_sec"] >= current_start and s["start_sec"] < current_end)
+                ]
+                
+                if window_segs:
+                    text_combined = " ".join([s["text"] for s in window_segs])
+                    chunks.append({
+                        "start_sec": window_segs[0]["start_sec"],
+                        "end_sec": window_segs[-1]["end_sec"],
+                        "text": text_combined
+                    })
+                
+                current_start += slide_step
+            
+            logger.info(f"Agrupado via sliding window em {len(chunks)} chunks")
+        else:
+            chunks = []
     else:
         # Texto simples: dividir em chunks de N caracteres com overlap
         logger.info("Formato TXT simples detectado — dividindo em chunks fixos")
+        chunks = []
         step = settings.chunk_size - settings.chunk_overlap
         for i in range(0, len(content), step):
             chunk_text = content[i:i + settings.chunk_size].strip()
@@ -84,48 +127,68 @@ def load_visual_descriptions(visual_path: Path) -> dict[float, dict]:
         {timestamp_sec: {description, model, frame_name}}
     """
     descriptions = {}
-    with open(visual_path) as f:
+    with open(visual_path, encoding="utf-8") as f:
         for line in f:
-            entry = json.loads(line)
-            if entry.get("description"):  # pular erros
-                descriptions[entry["timestamp_sec"]] = {
-                    "description": entry["description"],
-                    "model": entry.get("model", "unknown"),
-                    "frame_name": entry.get("frame_name", "")
-                }
+            if line.strip():
+                try:
+                    entry = json.loads(line)
+                    if entry.get("description"):  # pular erros
+                        descriptions[entry["timestamp_sec"]] = {
+                            "description": entry["description"],
+                            "model": entry.get("model", "unknown"),
+                            "frame_name": entry.get("frame_name", "")
+                        }
+                except json.JSONDecodeError:
+                    continue
     logger.info(f"Descrições visuais carregadas: {len(descriptions)} frames")
     return descriptions
 
 
-def find_closest_description(timestamp: float, descriptions: dict, tolerance: float = 5.0) -> str:
+def find_descriptions_in_range(start_sec: float, end_sec: float, descriptions: dict) -> str:
     """
-    Encontra a descrição visual mais próxima de um timestamp.
-
-    Args:
-        timestamp: Timestamp em segundos
-        descriptions: Dict {timestamp: description}
-        tolerance: Máxima diferença de tempo aceita (segundos)
-
-    Returns:
-        Descrição textual ou string vazia se nenhuma encontrada
+    Coleta descrições visuais no intervalo de tempo, downsamplando para
+    evitar redundância e bloat no documento. Pega 1 frame a cada 10 segundos no máximo.
     """
-    if not descriptions:
+    if not descriptions or start_sec < 0 or end_sec < 0:
         return ""
 
-    closest = min(descriptions.keys(), key=lambda t: abs(t - timestamp))
-    if abs(closest - timestamp) <= tolerance:
-        return descriptions[closest]["description"]
-    return ""
+    matched_keys = sorted([t for t in descriptions.keys() if start_sec <= t <= end_sec])
+    
+    if not matched_keys:
+        # Fallback: pegar o mais próximo ao início do chunk
+        closest = min(descriptions.keys(), key=lambda t: abs(t - start_sec))
+        if abs(closest - start_sec) <= 15.0:
+            return f"[{format_timestamp(closest)}] {descriptions[closest]['description']}"
+        return ""
+
+    # Downsample: mínimo de 10 segundos entre frames descritos
+    filtered_keys = []
+    last_time = -999.0
+    for k in matched_keys:
+        if k - last_time >= 10.0:
+            filtered_keys.append(k)
+            last_time = k
+
+    parts = []
+    last_desc = None
+    for k in filtered_keys:
+        desc = descriptions[k]["description"].strip()
+        # Evitar repetir descrições consecutivas idênticas
+        if desc != last_desc:
+            parts.append(f"[{format_timestamp(k)}] {desc}")
+            last_desc = desc
+
+    return " ".join(parts)
 
 
 def build_chunk_document(chunk: dict, visual_desc: str) -> str:
-    """Combina texto do chunk com descrição visual em documento único."""
+    """Combina texto do chunk com descrição visual em documento único estruturado."""
     parts = []
     if chunk["text"]:
-        parts.append(f"Fala: {chunk['text']}")
+        parts.append(f"Transcrição da Fala (Áudio):\n{chunk['text']}")
     if visual_desc:
-        parts.append(f"Visual: {visual_desc}")
-    return "\n".join(parts)
+        parts.append(f"Descrição Visual (Vídeo):\n{visual_desc}")
+    return "\n\n".join(parts)
 
 
 def index_video(
@@ -144,7 +207,7 @@ def index_video(
 
     # Inicializar ChromaDB
     chroma = chromadb.PersistentClient(path=db_path)
-    collection = chroma.get_or_create_collection(settings.collection_name)
+    collection = chroma.get_or_create_collection(settings.collection_name, metadata={"hnsw:space": "cosine"})
     logger.info(f"ChromaDB: {db_path} | Coleção: {settings.collection_name}")
 
     # Carregar modelo de embedding
@@ -153,7 +216,7 @@ def index_video(
 
     # Parsear transcrição
     transcript_chunks = parse_transcript(transcript_path)
-    logger.info(f"Chunks de transcrição: {len(transcript_chunks)}")
+    logger.info(f"Chunks de transcrição agrupados: {len(transcript_chunks)}")
 
     # Carregar descrições visuais (opcional)
     descriptions = {}
@@ -163,7 +226,12 @@ def index_video(
     # Verificar chunks já indexados para este vídeo
     existing = collection.get(where={"video_id": video_id})
     existing_ids = set(existing["ids"])
-    logger.info(f"Chunks já indexados para {video_id}: {len(existing_ids)}")
+    logger.info(f"Chunks já existentes para {video_id} no banco: {len(existing_ids)}")
+
+    # Limpar chunks antigos para este vídeo para permitir re-indexação/sobrescrita completa
+    if existing_ids:
+        logger.info(f"Removendo {len(existing_ids)} chunks antigos para re-indexação...")
+        collection.delete(ids=list(existing_ids))
 
     # Construir e indexar chunks
     indexed = 0
@@ -172,16 +240,13 @@ def index_video(
     for i, chunk in enumerate(transcript_chunks):
         chunk_id = f"{video_id}_chunk_{i:04d}"
 
-        if chunk_id in existing_ids:
-            continue  # já indexado
-
-        visual_desc = find_closest_description(chunk["start_sec"], descriptions)
+        visual_desc = find_descriptions_in_range(chunk["start_sec"], chunk["end_sec"], descriptions)
         document = build_chunk_document(chunk, visual_desc)
 
         if not document.strip():
             continue
 
-        embedding = embed_model.encode(document).tolist()
+        embedding = embed_model.encode(document, normalize_embeddings=True).tolist()
 
         batch_docs.append(document)
         batch_ids.append(chunk_id)
@@ -190,8 +255,8 @@ def index_video(
             "chunk_index": i,
             "start_sec": chunk["start_sec"],
             "end_sec": chunk["end_sec"],
-            "transcript": chunk["text"][:500],   # limitar tamanho
-            "visual_desc": visual_desc[:500],
+            "transcript": chunk["text"][:1000],   # expandir limite
+            "visual_desc": visual_desc[:1000],
         })
         batch_embeds.append(embedding)
 

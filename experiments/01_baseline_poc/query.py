@@ -60,7 +60,7 @@ def retrieve(
         Lista de metadados dos chunks recuperados
     """
     top_k = top_k or settings.retrieval_top_k
-    q_embedding = embed_model.encode(question).tolist()
+    q_embedding = embed_model.encode(question, normalize_embeddings=True).tolist()
 
     where = {"video_id": video_id} if video_id else None
 
@@ -284,7 +284,7 @@ def main():
     # Inicializar componentes
     logger.info(f"Carregando ChromaDB: {args.db}")
     chroma = chromadb.PersistentClient(path=args.db)
-    collection = chroma.get_or_create_collection(settings.collection_name)
+    collection = chroma.get_or_create_collection(settings.collection_name, metadata={"hnsw:space": "cosine"})
     logger.info(f"Chunks disponíveis: {collection.count()}")
 
     logger.info(f"Carregando embedding model: {settings.embed_model_local}")

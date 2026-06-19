@@ -6,7 +6,7 @@ descrições textuais de frames extraídos do vídeo.
 
 Uso:
     python extract_visual.py --input /path/to/frames/ --output descriptions.jsonl
-    python extract_visual.py --input frames/ --model moondream --batch-size 10
+    python extract_visual.py --input frames/ --model moondream --workers 10
 """
 
 import argparse
@@ -14,7 +14,9 @@ import base64
 import json
 import logging
 import time
+import threading
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 
@@ -107,16 +109,18 @@ def process_frames(
     frames_dir: Path,
     output_file: Path,
     model: str = None,
-    resume: bool = True
+    resume: bool = True,
+    workers: int = 4
 ) -> list[dict]:
     """
-    Processa todos os frames de um diretório e salva descrições em JSONL.
+    Processa todos os frames de um diretório em paralelo e salva descrições em JSONL.
 
     Args:
         frames_dir: Diretório com frames extraídos (JPG/PNG)
         output_file: Arquivo JSONL de saída
         model: Modelo vision (default: settings.vision_model)
         resume: Se True, pula frames já processados (útil para retomada)
+        workers: Número de threads de processamento paralelo
 
     Returns:
         Lista de dicionários com id, timestamp, frame_path, description
@@ -133,65 +137,103 @@ def process_frames(
     if resume and output_file.exists():
         with open(output_file) as f:
             for line in f:
-                entry = json.loads(line)
-                processed_ids.add(entry["frame_path"])
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        processed_ids.add(entry["frame_path"])
+                    except json.JSONDecodeError:
+                        continue
         logger.info(f"Retomando: {len(processed_ids)} frames já processados")
 
+    frames_to_process = [f for f in frames if str(f) not in processed_ids]
+    total_to_process = len(frames_to_process)
+    total_all = len(frames)
+    skipped = total_all - total_to_process
+
+    logger.info(f"Total de frames: {total_all} | Pulados: {skipped} | Para processar: {total_to_process}")
+
+    if not frames_to_process:
+        logger.info("Todos os frames já foram processados.")
+        return []
+
     results = []
-    total = len(frames)
-    skipped = 0
+    file_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    processed_count = 0
 
-    with open(output_file, "a") as out:
-        for i, frame_path in enumerate(frames, 1):
-            frame_str = str(frame_path)
+    def process_single_frame(frame_path: Path):
+        nonlocal processed_count
+        frame_str = str(frame_path)
+        timestamp = frame_to_timestamp(frame_path)
 
-            # Pular se já processado
-            if frame_str in processed_ids:
-                skipped += 1
-                continue
+        t0 = time.monotonic()
+        try:
+            description = describe_frame(frame_path, model=model)
+            elapsed = time.monotonic() - t0
 
-            timestamp = frame_to_timestamp(frame_path)
-            logger.info(f"[{i}/{total}] {frame_path.name} (t={timestamp:.1f}s) → {model}")
+            entry = {
+                "frame_path": frame_str,
+                "frame_name": frame_path.name,
+                "timestamp_sec": timestamp,
+                "description": description,
+                "model": model,
+                "latency_sec": round(elapsed, 2)
+            }
 
-            t0 = time.monotonic()
+            with counter_lock:
+                processed_count += 1
+                curr_count = processed_count
+
+            logger.info(f"[{curr_count}/{total_to_process}] ✓ {frame_path.name} (t={timestamp:.1f}s) in {elapsed:.1f}s → {description[:80]}...")
+
+            with file_lock:
+                with open(output_file, "a", encoding="utf-8") as out:
+                    out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    out.flush()
+
+            return entry
+
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            logger.error(f"  ✗ Erro em {frame_path.name}: {e}")
+            entry = {
+                "frame_path": frame_str,
+                "frame_name": frame_path.name,
+                "timestamp_sec": timestamp,
+                "description": "",
+                "model": model,
+                "error": str(e)
+            }
+
+            with counter_lock:
+                processed_count += 1
+                curr_count = processed_count
+
+            with file_lock:
+                with open(output_file, "a", encoding="utf-8") as out:
+                    out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    out.flush()
+
+            return entry
+
+    logger.info(f"Iniciando ThreadPoolExecutor com {workers} trabalhadores para o modelo {model}")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(process_single_frame, fp): fp for fp in frames_to_process}
+        for future in as_completed(futures):
             try:
-                description = describe_frame(frame_path, model=model)
-                elapsed = time.monotonic() - t0
+                res = future.result()
+                if res and res.get("description"):
+                    results.append(res)
+            except Exception as exc:
+                fp = futures[future]
+                logger.error(f"Futuro gerou uma exceção para {fp.name}: {exc}")
 
-                entry = {
-                    "frame_path": frame_str,
-                    "frame_name": frame_path.name,
-                    "timestamp_sec": timestamp,
-                    "description": description,
-                    "model": model,
-                    "latency_sec": round(elapsed, 2)
-                }
-
-                results.append(entry)
-                out.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                out.flush()
-
-                logger.info(f"  ✓ {elapsed:.1f}s → {description[:80]}...")
-
-            except Exception as e:
-                logger.error(f"  ✗ Erro em {frame_path.name}: {e}")
-                entry = {
-                    "frame_path": frame_str,
-                    "frame_name": frame_path.name,
-                    "timestamp_sec": timestamp,
-                    "description": "",
-                    "model": model,
-                    "error": str(e)
-                }
-                out.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                out.flush()
-
-    logger.info(f"\nConcluído: {len(results)} novos | {skipped} pulados | Total: {total}")
+    logger.info(f"\nConcluído: {len(results)} novos | {skipped} pulados | Total: {total_all}")
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extração de descrições visuais via avancos")
+    parser = argparse.ArgumentParser(description="Extração de descrições visuais via avancos (Multi-threaded)")
     parser.add_argument("--input", "-i", required=True, help="Diretório com frames JPG/PNG")
     parser.add_argument("--output", "-o", default="descriptions.jsonl", help="Arquivo JSONL de saída")
     parser.add_argument(
@@ -202,6 +244,7 @@ def main():
         help=f"Modelo vision (default: {settings.vision_model})"
     )
     parser.add_argument("--no-resume", action="store_true", help="Não retomar processo anterior")
+    parser.add_argument("--workers", "-w", type=int, default=4, help="Número de threads paralelas (default: 4)")
 
     args = parser.parse_args()
 
@@ -216,12 +259,14 @@ def main():
     logger.info(f"Modelo: {args.model}")
     logger.info(f"Input: {frames_dir}")
     logger.info(f"Output: {output_file}")
+    logger.info(f"Workers: {args.workers}")
 
     process_frames(
         frames_dir=frames_dir,
         output_file=output_file,
         model=args.model,
-        resume=not args.no_resume
+        resume=not args.no_resume,
+        workers=args.workers
     )
 
 
